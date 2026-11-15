@@ -11,11 +11,13 @@ from .core import D,premium,zscore,signal,Config
 from .bingx import BingX
 from .trading import PaperEngine
 from .telegram import notify
+from .intelligence import classify, aggregate, signal_summary, premium_series, system_health, daily_report
 
 load_dotenv(); CFG=Config();db=connect();client=BingX();engine=PaperEngine(db,CFG)
 state={'connected':False,'last_update':0,'error':None,'markets':0,'candidates':[],'last_cycle':0,'qualified':0}
 hist=defaultdict(lambda:deque(maxlen=17280)); quotes={};stats={};momentum=defaultdict(lambda:deque(maxlen=15))
 history_progress_cache={'ts':0,'data':{}}
+last_diagnostics_bucket = -1
 startup_time=int(time.time()); recovery_pending=bool(engine.positions()); last_volume=0; volumes={};last_book=0
 
 def event(level,message):
@@ -40,7 +42,7 @@ def book_prices(raw):
     return None
 
 async def collect():
-    global last_volume,recovery_pending
+    global last_volume,recovery_pending,last_diagnostics_bucket
     await asyncio.sleep(1)
     tick=0
     while True:
@@ -109,6 +111,22 @@ async def collect():
                             event('INFO',f'OPEN {side} {sym} #{trade_id} z={z:.2f}')
                             await notify(f'PAPER {side} {sym} #{trade_id}; Z={z:.2f}')
                             break
+            # Read-only diagnostics; never changes trading decisions or order execution.
+            diagnostics=[]
+            for c in candidates:
+                sym=c['symbol']
+                st=stats.get(sym,{})
+                minutes=item_funding_minutes(sym,raw,now)
+                reason=classify(c,quotes.get(sym),st,minutes,CFG,engine.can_open,now)
+                c['reason']=reason
+                c['spread']=round(st['spread'],4) if 'spread' in st else None
+                c['momentum']=round(st.get('momentum',0),3)
+                c['funding_minutes']=round(minutes,1) if minutes>=0 else None
+                diagnostics.append(c)
+            bucket=now//300
+            if bucket != last_diagnostics_bucket:
+                aggregate(db,diagnostics,now)
+                last_diagnostics_bucket=bucket
             state.update(connected=True,last_update=now,error=None,markets=count,qualified=len(eligible),candidates=sorted(candidates,key=lambda x:abs(x['z'] or 0),reverse=True)[:100],last_cycle=now)
         except Exception as exc:
             state.update(connected=False,error=str(exc));event('ERROR',f'collector: {exc}')
@@ -138,6 +156,12 @@ async def lifespan(app):
     await client.close();db.close()
 
 app=FastAPI(title='Ayla Funding Bot',lifespan=lifespan)
+# Additive schema migration, existing user SQLite data remains intact.
+db.execute('''CREATE TABLE IF NOT EXISTS signal_diagnostics(
+ bucket INTEGER NOT NULL,symbol TEXT NOT NULL,reason TEXT NOT NULL,
+ z REAL,premium REAL,PRIMARY KEY(bucket,symbol))''')
+db.execute('CREATE INDEX IF NOT EXISTS ix_signal_diagnostics_bucket ON signal_diagnostics(bucket)')
+db.commit()
 def auth(x_token):
     import hmac
     token=os.getenv('WEB_TOKEN','change-me')
@@ -205,3 +229,38 @@ async def paper(enabled:int,x_token:str|None=Header(default=None)):
     if enabled not in (0,1):raise HTTPException(400,'enabled must be 0 or 1')
     set_setting(db,'paper_enabled',enabled);event('INFO',f'Paper intent {enabled}')
     return {'paper_requested':bool(enabled),'execution':'PAPER_ONLY','recovery_pending':recovery_pending}
+
+@app.get('/api/intelligence')
+async def intelligence(x_token:str|None=Header(default=None)):
+    auth(x_token)
+    return {'reasons':signal_summary(db),'recent':[
+        {'symbol':c['symbol'],'reason':c.get('reason','UNKNOWN'),'z':c.get('z'),
+         'premium':c.get('premium'),'spread':c.get('spread'),'funding_minutes':c.get('funding_minutes')}
+        for c in state['candidates']]}
+
+@app.get('/api/radar')
+async def radar(x_token:str|None=Header(default=None)):
+    auth(x_token)
+    return sorted([{'symbol':c['symbol'],'premium':c['premium'],'z':c['z'],
+                    'volume':c['volume'],'spread':c.get('spread'),
+                    'reason':c.get('reason'),'history_ready':bool(c.get('history',{}).get('ready'))}
+                   for c in state['candidates']],
+                  key=lambda c:abs(c['z']) if c['z'] is not None else -1,reverse=True)
+
+@app.get('/api/premium/{symbol}')
+async def premium_chart(symbol:str,hours:int=24,x_token:str|None=Header(default=None)):
+    auth(x_token)
+    if not (1<=len(symbol)<=35 and all(c.isupper() or c.isdigit() or c=='-' for c in symbol)):
+        raise HTTPException(400,'Invalid symbol')
+    if hours<1 or hours>168:raise HTTPException(400,'hours must be 1..168')
+    return {'symbol':symbol,'hours':hours,'points':premium_series(db,symbol,hours)}
+
+@app.get('/api/health')
+async def health(x_token:str|None=Header(default=None)):
+    auth(x_token)
+    return system_health(db,state,startup_time,state['candidates'])
+
+@app.get('/api/daily')
+async def daily(x_token:str|None=Header(default=None)):
+    auth(x_token)
+    return daily_report(db)

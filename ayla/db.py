@@ -7,6 +7,8 @@ CREATE TABLE IF NOT EXISTS samples(symbol TEXT NOT NULL,ts INTEGER NOT NULL,prem
 CREATE INDEX IF NOT EXISTS ix_samples_time ON samples(ts);
 CREATE TABLE IF NOT EXISTS trades(id INTEGER PRIMARY KEY AUTOINCREMENT,symbol TEXT,side TEXT,qty TEXT,entry TEXT,exit TEXT,opened INTEGER,closed INTEGER,fee_open TEXT,fee_close TEXT,funding TEXT DEFAULT '0',pnl TEXT,reason TEXT,status TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT,ts INTEGER,level TEXT,message TEXT);
+CREATE TABLE IF NOT EXISTS signal_diagnostics(bucket INTEGER NOT NULL,symbol TEXT NOT NULL,reason TEXT NOT NULL,z REAL,premium REAL,PRIMARY KEY(bucket,symbol));
+CREATE INDEX IF NOT EXISTS ix_signal_diagnostics_bucket ON signal_diagnostics(bucket);
 CREATE TABLE IF NOT EXISTS funding_events(symbol TEXT,settlement INTEGER,trade_id INTEGER,rate TEXT,cashflow TEXT,PRIMARY KEY(symbol,settlement,trade_id));
 '''
 
