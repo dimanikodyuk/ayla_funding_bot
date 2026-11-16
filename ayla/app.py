@@ -10,6 +10,7 @@ from .db import connect,setting,set_setting
 from .core import D,premium,zscore,signal,Config
 from .bingx import BingX
 from .trading import PaperEngine
+from .history_intelligence import history_detail
 from .telegram import notify
 from .intelligence import classify, aggregate, signal_summary, premium_series, system_health, daily_report
 
@@ -276,3 +277,9 @@ async def health(x_token:str|None=Header(default=None)):
 async def daily(x_token:str|None=Header(default=None)):
     auth(x_token)
     return daily_report(db)
+
+@app.get('/api/history/{symbol}')
+async def history_intelligence(symbol:str,x_token:str|None=Header(default=None)):
+    auth(x_token)
+    try:return history_detail(db,symbol)
+    except ValueError:raise HTTPException(400,'Invalid symbol')

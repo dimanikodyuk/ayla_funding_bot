@@ -63,3 +63,18 @@
 - Existing SQLite, .env, trades and settings are preserved. Old history is reused.
 - **Deployment:** stop systemd, back up data/ayla.sqlite* while stopped, overwrite only the patch files, run tests, restart.
 - This is a reliability fix, not proof of profitable strategy.
+
+
+## History Intelligence 2.0
+
+На вкладці **System Health** доступні вибір контракту, погодинна гістограма
+24-годинного покриття, кількість відсутніх хвилин, свіжість котирувань,
+найбільший розрив і прогноз часу до готовності. API: `GET /api/history/{symbol}`
+(заголовок `X-Token`). Дані читаються з наявної SQLite, без міграцій.
+
+**ETA є умовним:** припускає одну заповнену хвилину на кожну майбутню
+хвилину й враховує вихід старих хвилин із 24-годинного вікна. Якщо
+збір зупиниться, прогноз перестане бути актуальним. Поріг готовності
+залишається 80% (1152/1440), потрібні свіжі дані та достатній часовий
+розмах. Готовність історії не означає наявність сигналу або відкриття угоди.
+Пауза Paper Trading не зупиняє колектор.
