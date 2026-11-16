@@ -11,6 +11,7 @@ from .core import D,premium,zscore,signal,Config
 from .bingx import BingX
 from .trading import PaperEngine
 from .history_intelligence import history_detail
+from .research_lab import research_report
 from .telegram import notify
 from .intelligence import classify, aggregate, signal_summary, premium_series, system_health, daily_report
 
@@ -282,4 +283,10 @@ async def daily(x_token:str|None=Header(default=None)):
 async def history_intelligence(symbol:str,x_token:str|None=Header(default=None)):
     auth(x_token)
     try:return history_detail(db,symbol)
+    except ValueError:raise HTTPException(400,'Invalid symbol')
+
+@app.get('/api/research/{symbol}')
+async def research(symbol:str,x_token:str|None=Header(default=None)):
+    auth(x_token)
+    try:return research_report(db,symbol)
     except ValueError:raise HTTPException(400,'Invalid symbol')
