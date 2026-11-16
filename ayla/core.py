@@ -17,7 +17,7 @@ def premium(mark,index):
     if D(index)<=0:raise ValueError('invalid index')
     return (D(mark)/D(index)-1)*100
 def zscore(value,history):
-    if len(history)<13824:return None # >=80% of 24h at 5s cadence
+    if len(history)<1152:return None # >=80% of 24h at 1-minute cadence
     values=[float(v) for v in history]
     mean=sum(values)/len(values)
     variance=sum((v-mean)**2 for v in values)/len(values)

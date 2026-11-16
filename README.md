@@ -54,3 +54,12 @@
 Нова таблиця `signal_diagnostics` створюється автоматично через `CREATE TABLE IF NOT EXISTS`, без очищення наявних таблиць.
 
 Вебвкладки з аналітикою підвантажують дані під час відкриття і оновлюють їх приблизно кожні 10 секунд. Збереження діагностичних знімків відбувається лише під час активного циклу збору. Для інструментів без достатньої історії графік показує доступні точки, а сигнали залишаються в `WARMING_UP`.
+
+
+## Collector Reliability patch (2026-11-16)
+- Each successful REST cycle persists samples at most once per 30 seconds per symbol; no wall-clock modulo condition.
+- History readiness uses distinct observed minute buckets in a rolling 24h window (>=1152/1440, 80%), a baseline spanning >=23h55m, and a recent sample (<=120s). Gaps are not filled artificially.
+- Z-score uses one sample per observed minute instead of weighting irregular REST polling frequencies; 1152 observed minutes required.
+- Existing SQLite, .env, trades and settings are preserved. Old history is reused.
+- **Deployment:** stop systemd, back up data/ayla.sqlite* while stopped, overwrite only the patch files, run tests, restart.
+- This is a reliability fix, not proof of profitable strategy.

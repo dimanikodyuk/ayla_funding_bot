@@ -8,7 +8,7 @@ def test_pnl():
 def test_funding():
     assert funding_cashflow('SHORT',20,'0.001')==Decimal('0.020')
     assert funding_cashflow('LONG',20,'0.001')==Decimal('-0.020')
-def test_zscore():assert zscore(0,[0]*13824)==0
+def test_zscore():assert zscore(0,[0]*1152)==0
 def test_signal():
     assert signal(.2,2.5,6000000,.03,0,60,delta=.16)=='SHORT'
     assert signal(-.2,-2.5,6000000,.03,0,60,delta=-.16)=='LONG'

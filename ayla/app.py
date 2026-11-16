@@ -15,9 +15,10 @@ from .intelligence import classify, aggregate, signal_summary, premium_series, s
 
 load_dotenv(); CFG=Config();db=connect();client=BingX();engine=PaperEngine(db,CFG)
 state={'connected':False,'last_update':0,'error':None,'markets':0,'candidates':[],'last_cycle':0,'qualified':0}
-hist=defaultdict(lambda:deque(maxlen=17280)); quotes={};stats={};momentum=defaultdict(lambda:deque(maxlen=15))
+hist=defaultdict(lambda:deque(maxlen=1440)); hist_minutes=defaultdict(lambda:deque(maxlen=1440)); quotes={};stats={};momentum=defaultdict(lambda:deque(maxlen=15))
 history_progress_cache={'ts':0,'data':{}}
 last_diagnostics_bucket = -1
+last_saved = {}
 startup_time=int(time.time()); recovery_pending=bool(engine.positions()); last_volume=0; volumes={};last_book=0
 
 def event(level,message):
@@ -61,11 +62,20 @@ async def collect():
                     if not sym.endswith('-USDT') or mark<=0 or idx<=0:continue
                     count+=1;p=premium(mark,idx);history=hist[sym]
                     vol=volumes.get(sym,D(0))
-                    z=zscore(p,list(history)) if vol>=CFG.min_volume and len(history)>=13824 and history_progress([sym], now)[sym]['ready'] else None
+                    # One observation per minute for a time-balanced 24h Z-score.
+                    minute=now//60
+                    while hist_minutes[sym] and hist_minutes[sym][0] < minute-1439:
+                        hist_minutes[sym].popleft(); history.popleft()
+                    progress=history_progress([sym],now)[sym] if vol>=CFG.min_volume and len(history)>=1152 else None
+                    z=zscore(p,list(history)) if progress and progress['ready'] else None
                     mean=sum(history)/len(history) if z is not None else p
                     delta=p-mean
-                    history.append(p)
-                    if now%5==0:db.execute('INSERT OR IGNORE INTO samples VALUES(?,?,?,?,?)',(sym,now,float(p),float(mark),float(idx)))
+                    if not hist_minutes[sym] or hist_minutes[sym][-1]!=minute:
+                        history.append(p); hist_minutes[sym].append(minute)
+                    # No modulo-of-wall-clock gate: a slow REST cycle must not silently lose samples.
+                    if now-last_saved.get(sym,0)>=30:
+                        db.execute('INSERT OR IGNORE INTO samples VALUES(?,?,?,?,?)',(sym,now,float(p),float(mark),float(idx)))
+                        last_saved[sym]=now
                     momentum[sym].append((now,idx))
                     old=next((v for t,v in momentum[sym] if now-t>=55),None)
                     mom=float((idx/old-1)*100) if old else 0.0
@@ -145,8 +155,12 @@ def item_funding_minutes(symbol,raw,now):
 @asynccontextmanager
 async def lifespan(app):
     since=int(time.time())-86400
-    for row in db.execute('SELECT symbol,premium FROM samples WHERE ts>=? ORDER BY ts',(since,)):
-        hist[row['symbol']].append(D(row['premium']))
+    # Rebuild 1-minute series after a power loss, without weighting fast cycles more heavily.
+    for row in db.execute('SELECT symbol,ts,premium FROM samples WHERE ts>=? ORDER BY ts',(since,)):
+        sym=row['symbol']; minute=row['ts']//60
+        if not hist_minutes[sym] or hist_minutes[sym][-1]!=minute:
+            hist_minutes[sym].append(minute); hist[sym].append(D(row['premium']))
+        last_saved[sym]=max(last_saved.get(sym,0),row['ts'])
     event('INFO','Service start; paper broker only; historical gaps require recovery')
     task=asyncio.create_task(collect())
     yield
@@ -171,33 +185,31 @@ def auth(x_token):
 async def home():return (Path(__file__).resolve().parent.parent/'static/index.html').read_text(encoding='utf8')
 
 def history_progress(symbols, now=None):
-    """Observed coverage of the previous 24h, using persisted sample timestamps.
+    """Coverage of distinct minute buckets, not number of REST polls.
 
-    80% is the minimum sample coverage, but the observation window must also
-    span the full 24h; restarting the service never resets this progress.
+    A complete 24-hour window has 1440 buckets; at least 1152 distinct
+    observed minutes (80%) are required, with observations near both ends.
+    Missing intervals are never synthesized or backfilled.
     """
     now = int(time.time()) if now is None else int(now)
-    if now - history_progress_cache['ts'] < 30 and set(symbols).issubset(history_progress_cache['data']):
+    if 0 <= now-history_progress_cache['ts'] < 30 and set(symbols).issubset(history_progress_cache['data']):
         return {sym: history_progress_cache['data'][sym] for sym in symbols}
-    result = {}
-    start = now - 86400
+    result={}; start=now-86400
     for sym in symbols:
-        r = db.execute('SELECT MIN(ts) AS first_ts, MAX(ts) AS last_ts, COUNT(*) AS n '
-                       'FROM samples WHERE symbol=? AND ts>=? AND ts<=?',
-                       (sym, start, now)).fetchone()
-        count = int(r['n'])
-        first = r['first_ts']
-        last = r['last_ts']
-        # Report both coverage and age: gaps must not look like continuous collection.
-        span = max(0, min(86400, now - first)) if first is not None else 0
-        covered = min(86400, count * 5)
-        percent = min(100.0, 100.0 * covered / 86400)
-        ready = bool(first is not None and span >= 86395 and count >= 13824)
-        result[sym] = {'observed_seconds': span, 'sample_count': count,
-                       'coverage_percent': round(percent, 1),
-                       'minimum_samples': 13824, 'window_seconds': 86400,
-                       'ready': ready, 'last_sample_ts': last}
-    history_progress_cache.update(ts=now, data={**(history_progress_cache['data'] if now-history_progress_cache['ts']<30 else {}), **result})
+        r=db.execute("""SELECT MIN(ts) AS first_ts, MAX(ts) AS last_ts,
+                      COUNT(*) AS n, COUNT(DISTINCT CAST(ts/60 AS INTEGER)) AS minutes
+                      FROM samples WHERE symbol=? AND ts>=? AND ts<=?""",
+                     (sym,start,now)).fetchone()
+        count=int(r['n']); minutes=int(r['minutes']); first=r['first_ts']; last=r['last_ts']
+        span=max(0,min(86400,now-first)) if first is not None else 0
+        percent=min(100.0,100.0*minutes/1440)
+        # Full-day baseline and recent observations, in addition to 80% coverage.
+        ready=bool(first is not None and span>=86100 and now-last<=120 and minutes>=1152)
+        result[sym]={'observed_seconds':span,'sample_count':count,
+                     'observed_minutes':minutes,'coverage_percent':round(percent,1),
+                     'minimum_samples':1152,'window_seconds':86400,
+                     'ready':ready,'last_sample_ts':last}
+    history_progress_cache.update(ts=now,data={**(history_progress_cache['data'] if 0<=now-history_progress_cache['ts']<30 else {}),**result})
     return result
 
 @app.get('/api/status')
