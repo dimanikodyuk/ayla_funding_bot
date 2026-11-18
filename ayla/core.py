@@ -16,8 +16,8 @@ class Config:
 def premium(mark,index):
     if D(index)<=0:raise ValueError('invalid index')
     return (D(mark)/D(index)-1)*100
-def zscore(value,history):
-    if len(history)<1152:return None # >=80% of 24h at 1-minute cadence
+def zscore(value,history,min_samples=1152):
+    if len(history)<min_samples:return None # configurable 80% coverage of chosen window
     values=[float(v) for v in history]
     mean=sum(values)/len(values)
     variance=sum((v-mean)**2 for v in values)/len(values)

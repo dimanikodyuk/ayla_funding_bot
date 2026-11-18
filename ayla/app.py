@@ -16,6 +16,8 @@ from .telegram import notify
 from .intelligence import classify, aggregate, signal_summary, premium_series, system_health, daily_report
 
 load_dotenv(); CFG=Config();db=connect();client=BingX();engine=PaperEngine(db,CFG)
+TRADE_WINDOW_MINUTES=360
+TRADE_REQUIRED_MINUTES=288
 state={'connected':False,'last_update':0,'error':None,'markets':0,'candidates':[],'last_cycle':0,'qualified':0}
 hist=defaultdict(lambda:deque(maxlen=1440)); hist_minutes=defaultdict(lambda:deque(maxlen=1440)); quotes={};stats={};momentum=defaultdict(lambda:deque(maxlen=15))
 history_progress_cache={'ts':0,'data':{}}
@@ -68,9 +70,17 @@ async def collect():
                     minute=now//60
                     while hist_minutes[sym] and hist_minutes[sym][0] < minute-1439:
                         hist_minutes[sym].popleft(); history.popleft()
-                    progress=history_progress([sym],now)[sym] if vol>=CFG.min_volume and len(history)>=1152 else None
-                    z=zscore(p,list(history)) if progress and progress['ready'] else None
-                    mean=sum(history)/len(history) if z is not None else p
+                    # The trading model uses only the last 6h of real minute buckets.
+                    # The 24h history remains intact for the Research Lab and diagnostics.
+                    trade_minutes=[(m,v) for m,v in zip(hist_minutes[sym],history) if minute-TRADE_WINDOW_MINUTES+1<=m<=minute]
+                    recent=[v for m,v in trade_minutes if m<minute]
+                    last_minute=trade_minutes[-1][0] if trade_minutes else None
+                    first_minute=trade_minutes[0][0] if trade_minutes else None
+                    trade_ready=bool(len(recent)>=TRADE_REQUIRED_MINUTES and
+                        first_minute is not None and minute-first_minute>=TRADE_REQUIRED_MINUTES and
+                        last_minute is not None and minute-last_minute<=2)
+                    z=zscore(p,recent,min_samples=TRADE_REQUIRED_MINUTES) if trade_ready else None
+                    mean=sum(recent)/len(recent) if z is not None else p
                     delta=p-mean
                     if not hist_minutes[sym] or hist_minutes[sym][-1]!=minute:
                         history.append(p); hist_minutes[sym].append(minute)
@@ -84,7 +94,7 @@ async def collect():
                     stats[sym]={'z':z,'premium':float(p),'delta':float(delta),'momentum':mom}
                     if vol>=CFG.min_volume:
                         eligible.append((sym,abs(float(delta)),z,p,vol,mom))
-                        candidates.append({'symbol':sym,'premium':round(float(p),4),'z':round(z,3) if z is not None else None,'volume':float(vol),'mark':str(mark),'signal':'WARMING_UP' if z is None else 'OBSERVE'})
+                        candidates.append({'symbol':sym,'premium':round(float(p),4),'z':round(z,3) if z is not None else None,'volume':float(vol),'mark':str(mark),'signal':'WARMING_UP' if z is None else 'OBSERVE', 'trade_history':{'ready':trade_ready,'observed_minutes':len(recent),'required_minutes':TRADE_REQUIRED_MINUTES,'window_minutes':TRADE_WINDOW_MINUTES,'coverage_percent':round(len(recent)/TRADE_WINDOW_MINUTES*100,1)}})
                 except (KeyError,TypeError,ValueError,ArithmeticError,ZeroDivisionError):continue
             db.commit()
             # Book requests are limited to top 10 active/interesting symbols per cycle.
@@ -225,8 +235,8 @@ async def status(x_token:str|None=Header(default=None)):
             px=D(q['bid'] if p['side']=='LONG' else q['ask'])
             unreal+=(D('1') if p['side']=='LONG' else D('-1'))*D(p['qty'])*(px-D(p['entry']))-D(p['fee_open'])-D(p['qty'])*px*CFG.fee_rate
     progress = history_progress([c['symbol'] for c in state['candidates']])
-    candidates = [{**c, 'history': progress.get(c['symbol'])} for c in state['candidates']]
-    return {**state, 'candidates': candidates, 'history_window_hours': 24, 'history_required_coverage_pct': 80, 'mode':'RECOVERING' if recovery_pending else ('PAPER_ACTIVE' if setting(db,'paper_enabled','0')=='1' else 'COLLECTING'),'paper_execution':'ENABLED' if setting(db,'paper_enabled','0')=='1' else 'PAUSED','balance':str(balance),'equity':str(balance+unreal),'realized_pnl':str(engine.realized()),'unrealized_pnl':str(unreal),'open_positions':len(pos),'strategy':'premium-mean-reversion','live_execution':'DISABLED'}
+    candidates = [{**c, 'history': c.get('trade_history'), 'history_24h': progress.get(c['symbol'])} for c in state['candidates']]
+    return {**state, 'candidates': candidates, 'history_window_hours': 6, 'history_required_coverage_pct': 80, 'trade_history_required_minutes': TRADE_REQUIRED_MINUTES, 'history_diagnostics_window_hours':24, 'mode':'RECOVERING' if recovery_pending else ('PAPER_ACTIVE' if setting(db,'paper_enabled','0')=='1' else 'COLLECTING'),'paper_execution':'ENABLED' if setting(db,'paper_enabled','0')=='1' else 'PAUSED','balance':str(balance),'equity':str(balance+unreal),'realized_pnl':str(engine.realized()),'unrealized_pnl':str(unreal),'open_positions':len(pos),'strategy':'premium-mean-reversion','live_execution':'DISABLED'}
 
 @app.get('/api/trades')
 async def trades(x_token:str|None=Header(default=None)):
