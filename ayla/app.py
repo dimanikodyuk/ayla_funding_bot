@@ -396,6 +396,21 @@ async def health(x_token:str|None=Header(default=None)):
     auth(x_token)
     return system_health(db,state,startup_time,state['candidates'])
 
+@app.get('/api/profitability')
+async def profitability(x_token:str|None=Header(default=None)):
+    auth(x_token)
+    from decimal import Decimal
+    rows=db.execute("SELECT pnl,fee_open,fee_close FROM trades WHERE status='CLOSED' AND pnl IS NOT NULL").fetchall()
+    net=[Decimal(str(r['pnl'])) for r in rows]
+    fees=sum((Decimal(str(r['fee_open'] or 0))+Decimal(str(r['fee_close'] or 0)) for r in rows),Decimal(0))
+    net_sum=sum(net,Decimal(0))
+    gross_abs=sum((abs(v+Decimal(str(r['fee_open'] or 0))+Decimal(str(r['fee_close'] or 0))) for v,r in zip(net,rows)),Decimal(0))
+    pos=sum((v for v in net if v>0),Decimal(0))
+    neg=-sum((v for v in net if v<0),Decimal(0))
+    pf=float(pos/neg) if neg>0 else None
+    return {'trades':len(net),'net_pnl':float(net_sum),'avg_net':float(net_sum/len(net)) if net else None,
+            'profit_factor':pf,'total_fees':float(fees),'fees_to_abs_gross_pct':float(fees/gross_abs*100) if gross_abs>0 else None}
+
 @app.get('/api/trade-heatmap')
 async def trade_heatmap(x_token:str|None=Header(default=None)):
     auth(x_token)
