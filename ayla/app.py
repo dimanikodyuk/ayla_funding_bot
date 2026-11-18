@@ -150,6 +150,17 @@ async def collect():
                         if closed:await notify_trade(closed,engine.decision(closed['id'],'ENTRY'))
                         else:await notify(f'⚠️ Recovery gap: {sym} PnL {pnl}')
                     if not engine.positions():recovery_pending=False
+                # Capture executable quotes for currently open Paper positions only.
+                # No interpolation and no synthetic historical prices.
+                for position in engine.positions():
+                    symbol=position['symbol']
+                    q=fresh_quote(quotes,symbol,int(time.time()))
+                    if q:
+                        with db:
+                            db.execute('INSERT OR IGNORE INTO trade_quotes(trade_id,ts,bid,ask,mark,premium,z) VALUES(?,?,?,?,?,?,?)',
+                                (position['id'],int(time.time()),str(q['bid']),str(q['ask']),
+                                 str(stats.get(symbol,{}).get('mark') or '') or None,
+                                 stats.get(symbol,{}).get('premium'),stats.get(symbol,{}).get('z')))
                 for sym,reason,pnl in engine.manage(quotes,stats):
                     event('INFO',f'CLOSE {sym} {reason} PnL={pnl}')
                     closed=next((t for t in engine.closed(20) if t['symbol']==sym and t['reason']==reason),None)
@@ -293,25 +304,45 @@ async def status(x_token:str|None=Header(default=None)):
     candidates = [{**c, 'history': c.get('trade_history'), 'history_24h': progress.get(c['symbol'])} for c in state['candidates']]
     return {**state, 'candidates': candidates, 'history_window_hours': 6, 'history_required_coverage_pct': 80, 'trade_history_required_minutes': TRADE_REQUIRED_MINUTES, 'history_diagnostics_window_hours':24, 'market_data':{**market_health,'ticker_age_seconds':int(time.time())-market_health['ticker_last_success'] if market_health['ticker_last_success'] else None}, 'mode':'RECOVERING' if recovery_pending else ('PAPER_ACTIVE' if setting(db,'paper_enabled','0')=='1' else 'COLLECTING'),'paper_execution':'ENABLED' if setting(db,'paper_enabled','0')=='1' else 'PAUSED','balance':str(balance),'equity':str(balance+unreal),'realized_pnl':str(engine.realized()),'unrealized_pnl':str(unreal),'open_positions':len(pos),'strategy':'premium-mean-reversion','live_execution':'DISABLED'}
 
+# Sparse executable quote history. Only future trades gain these points.
+db.execute('''CREATE TABLE IF NOT EXISTS trade_quotes(
+ trade_id INTEGER NOT NULL,ts INTEGER NOT NULL,bid TEXT NOT NULL,ask TEXT NOT NULL,
+ mark TEXT,premium REAL,z REAL,PRIMARY KEY(trade_id,ts))''')
+db.commit()
+
 @app.get('/api/trades')
 async def trades(x_token:str|None=Header(default=None)):
     auth(x_token);return [dict(r) for r in db.execute('SELECT * FROM trades ORDER BY id DESC LIMIT 200')]
 @app.get('/api/trade-chart/{trade_id}')
-async def trade_chart(trade_id:int,minutes:int=15,x_token:str|None=Header(default=None)):
-    """Read-only trade context. Samples are minute Mark/Index snapshots, NOT executable quotes."""
+async def trade_chart(trade_id:int,minutes:int=0,x_token:str|None=Header(default=None)):
+    """Trade replay: executable quote samples and separate minute Mark reference."""
     auth(x_token)
-    if minutes not in (5,15,30,60):raise HTTPException(400,'minutes must be 5, 15, 30 or 60')
+    if minutes not in (0,1,5,15,30,60):raise HTTPException(400,'Unsupported window')
     trade=db.execute('SELECT * FROM trades WHERE id=?',(trade_id,)).fetchone()
     if trade is None:raise HTTPException(404,'Trade not found')
-    t=dict(trade)
-    opened=int(t['opened']);closed=int(t['closed']) if t['closed'] is not None else int(time.time())
-    start=opened-minutes*60;end=closed+minutes*60
-    # Limit response size and avoid loading an unbounded period for long-lived positions.
-    rows=db.execute("""SELECT ts,mark,premium FROM samples
-      WHERE symbol=? AND ts BETWEEN ? AND ? ORDER BY ts LIMIT 3000""",(t['symbol'],start,end)).fetchall()
-    return {'trade':t,'points':[{'ts':r['ts'],'mark':r['mark'],'premium':r['premium']} for r in rows],
-            'window_minutes':minutes,'truncated':len(rows)>=3000,
-            'note':'Mark Price is a sampled reference, not executable Bid/Ask. Entry/exit are actual Paper fill prices. Short trades may have no samples between fills.'}
+    t=dict(trade);opened=int(t['opened']);closed=int(t['closed']) if t['closed'] else int(time.time())
+    pad=minutes*60 if minutes else 30
+    start=opened-pad;end=closed+(minutes*60 if minutes else 60)
+    rows=db.execute("SELECT ts,mark,premium FROM samples WHERE symbol=? AND ts BETWEEN ? AND ? ORDER BY ts LIMIT 3001",(t['symbol'],start,end)).fetchall()
+    quotes=db.execute("SELECT ts,bid,ask,mark,premium,z FROM trade_quotes WHERE trade_id=? ORDER BY ts LIMIT 10001",(trade_id,)).fetchall()
+    decisions=db.execute("SELECT ts,event,z,premium,reason FROM exit_decisions WHERE trade_id=? ORDER BY ts,id",(trade_id,)).fetchall()
+    from decimal import Decimal
+    D=Decimal
+    qty=D(t['qty']);entry=D(t['entry']);px=D(t['exit']) if t['exit'] is not None else None
+    gross=(qty*(px-entry)*(1 if t['side']=='LONG' else -1)) if px is not None else None
+    fee_open=D(t['fee_open'] or '0');fee_close=D(t['fee_close'] or '0');funding=D(t['funding'] or '0')
+    notional=qty*entry
+    # Break-even price including estimated exit fee at configured fee_rate.
+    rate=CFG.fee_rate
+    if t['side']=='LONG':break_even=(qty*entry+fee_open-funding)/(qty*(1-rate))
+    else:break_even=(qty*entry-fee_open+funding)/(qty*(1+rate))
+    return {'trade':t,'points':[dict(r) for r in rows[:3000]],'quotes':[dict(r) for r in quotes[:10000]],
+            'decisions':[dict(r) for r in decisions], 'window_minutes':minutes,
+            'truncated':len(rows)>3000 or len(quotes)>10000,
+            'costs':{'gross':str(gross) if gross is not None else None,'fee_open':str(fee_open),
+                     'fee_close':str(fee_close),'funding':str(funding),
+                     'net':t['pnl'],'break_even_price':str(break_even),'notional':str(notional)},
+            'note':'Bid/Ask captured only while an open Paper position exists, from v3.7 onward. Historical trades cannot be reconstructed. Mark is minute reference only.'}
 
 @app.get('/api/events')
 async def events(x_token:str|None=Header(default=None)):

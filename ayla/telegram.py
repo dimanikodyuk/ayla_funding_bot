@@ -89,12 +89,22 @@ async def notify_trade(trade,entry=None,exit=None):
           f"Premium: {_fmt((entry or {}).get('premium'),4)}% → {_fmt((exit or {}).get('premium'),4)}%\n"
           f"Entry: {trade.get('entry')} | Exit: {trade.get('exit') or '—'}\n"
           f"PnL: {pnl} USDT | {trade.get('reason') or 'PAPER_OPEN'}")
-    if os.getenv('TELEGRAM_WIDGETS_ENABLED','1').strip().lower() not in ('0','false','no'):
+    if os.getenv('TELEGRAM_WIDGETS_ENABLED','0').strip().lower() not in ('0','false','no'):
         try:
             card=trade_card(trade,entry,exit)
             ok,error=await _send('sendWidget',{'html':card,'width':320,'height':250,'caption':text[:900]})
             if ok:return 'widget'
             if error!='not_configured':log.warning('Telegram sendWidget unavailable (%s); text fallback',error)
         except Exception as exc:log.warning('Telegram widget render failed: %s',type(exc).__name__)
+    # Optional standard Telegram inline URL button to a publicly reachable HTTPS dashboard.
+    # Never expose a local/private dashboard URL or API token in Telegram.
+    public_url=os.getenv('TELEGRAM_PUBLIC_DASHBOARD_URL','').strip()
+    if public_url.startswith('https://'):
+        from urllib.parse import urlsplit
+        host=urlsplit(public_url).hostname or ''
+        if host not in ('localhost','127.0.0.1') and not host.endswith('.local'):
+            ok,error=await _send('sendMessage',{'text':text,'reply_markup':{'inline_keyboard':[[{'text':'📈 Відкрити Trade Replay','url':public_url.rstrip('/')+'/#trades'}]]}})
+            if ok:return 'inline_url'
+            log.warning('Telegram inline URL failed (%s); text fallback',error)
     await notify(text)
     return 'text'
