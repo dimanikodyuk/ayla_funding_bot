@@ -396,6 +396,19 @@ async def health(x_token:str|None=Header(default=None)):
     auth(x_token)
     return system_health(db,state,startup_time,state['candidates'])
 
+@app.get('/api/trade-heatmap')
+async def trade_heatmap(x_token:str|None=Header(default=None)):
+    auth(x_token)
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    tz=ZoneInfo('Europe/Kyiv')
+    cells={(day,hour):{'day':day,'hour':hour,'count':0,'wins':0,'net':0.0} for day in range(7) for hour in range(24)}
+    for r in db.execute("SELECT opened,pnl FROM trades WHERE status='CLOSED' AND opened IS NOT NULL AND pnl IS NOT NULL"):
+        local=datetime.fromtimestamp(int(r['opened']),tz)
+        c=cells[(local.weekday(),local.hour)]
+        pnl=float(r['pnl']); c['count']+=1; c['wins']+=int(pnl>0); c['net']+=pnl
+    return {'timezone':'Europe/Kyiv','basis':'entry_time','cells':[{**c,'net':round(c['net'],6),'avg_net':round(c['net']/c['count'],6) if c['count'] else None,'win_rate':round(c['wins']/c['count']*100,1) if c['count'] else None} for c in cells.values()]}
+
 @app.get('/api/daily')
 async def daily(x_token:str|None=Header(default=None)):
     auth(x_token)
