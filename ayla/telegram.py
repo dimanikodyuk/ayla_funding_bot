@@ -162,6 +162,30 @@ async def _bot_api(client,method,payload):
     if not data.get('ok'):raise RuntimeError(str(data.get('description','Bot API error'))[:180])
     return data['result']
 
+async def native_widget_probe(client, chat_id):
+    """Diagnostic only: try actual Telegram sendWidget, never place orders."""
+    demo = {"id": 0, "symbol": "DEMO-USDT", "side": "LONG", "entry": "1.0000",
+            "opened": int(datetime.now().timestamp()), "status": "OPEN"}
+    card = trade_card(demo, {"z": -2.5, "premium": -0.12})
+    payload = {"chat_id": chat_id, "html": card, "width": 340, "height": 0,
+               "caption": "Ayla Funding Bot — нативний тест HTML Widget",
+               "chat_data": {"source": "ayla_funding", "test": True},
+               "allow_queries": False, "is_shared": False}
+    token = os.getenv('TELEGRAM_BOT_TOKEN', '').strip()
+    try:
+        response = await client.post(f'https://api.telegram.org/bot{token}/sendWidget',
+                                     json=payload, timeout=35)
+        try:
+            data = response.json()
+        except ValueError:
+            return f'HTTP {response.status_code}: відповідь не JSON'
+        if data.get('ok'):
+            return 'УСПІХ: Telegram прийняв sendWidget; перевір відображення HTML у чаті.'
+        return f'HTTP {response.status_code}: {str(data.get("description", "Unknown Bot API error"))[:300]}'
+    except httpx.HTTPError as exc:
+        return f'Мережева помилка: {type(exc).__name__}'
+
+
 async def telegram_poll(db):
     """Read-only Telegram callbacks. Errors never interrupt market collection."""
     token=os.getenv('TELEGRAM_BOT_TOKEN','').strip()
@@ -192,7 +216,13 @@ async def telegram_poll(db):
                         msg=update.get('message') or {}
                         if str((msg.get('chat') or {}).get('id',''))!=chat:continue
                         command=(msg.get('text') or '').split(' ',1)[0].split('@')[0]
-                        if command=='/widget_test':
+                        if command=='/widget_native_test':
+                            result = await native_widget_probe(client, chat)
+                            await _bot_api(client, 'sendMessage', {
+                                'chat_id': chat,
+                                'text': '🧪 HTML Widget Sandbox — результат\n' + result
+                            })
+                        elif command=='/widget_test':
                             await _bot_api(client,'sendMessage',{'chat_id':chat,
                                 'text':'🐾 Ayla Funding Bot — перевірка інтерактивних кнопок',
                                 'reply_markup':{'inline_keyboard':[[{'text':'✅ Перевірити кнопку','callback_data':'ayla:signal:0'}]]}})
