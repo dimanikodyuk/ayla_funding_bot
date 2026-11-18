@@ -295,6 +295,23 @@ async def status(x_token:str|None=Header(default=None)):
 @app.get('/api/trades')
 async def trades(x_token:str|None=Header(default=None)):
     auth(x_token);return [dict(r) for r in db.execute('SELECT * FROM trades ORDER BY id DESC LIMIT 200')]
+@app.get('/api/trade-chart/{trade_id}')
+async def trade_chart(trade_id:int,minutes:int=15,x_token:str|None=Header(default=None)):
+    """Read-only trade context. Samples are minute Mark/Index snapshots, NOT executable quotes."""
+    auth(x_token)
+    if minutes not in (5,15,30,60):raise HTTPException(400,'minutes must be 5, 15, 30 or 60')
+    trade=db.execute('SELECT * FROM trades WHERE id=?',(trade_id,)).fetchone()
+    if trade is None:raise HTTPException(404,'Trade not found')
+    t=dict(trade)
+    opened=int(t['opened']);closed=int(t['closed']) if t['closed'] is not None else int(time.time())
+    start=opened-minutes*60;end=closed+minutes*60
+    # Limit response size and avoid loading an unbounded period for long-lived positions.
+    rows=db.execute("""SELECT ts,mark,premium FROM samples
+      WHERE symbol=? AND ts BETWEEN ? AND ? ORDER BY ts LIMIT 3000""",(t['symbol'],start,end)).fetchall()
+    return {'trade':t,'points':[{'ts':r['ts'],'mark':r['mark'],'premium':r['premium']} for r in rows],
+            'window_minutes':minutes,'truncated':len(rows)>=3000,
+            'note':'Mark Price is a sampled reference, not executable Bid/Ask. Entry/exit are actual Paper fill prices. Short trades may have no samples between fills.'}
+
 @app.get('/api/events')
 async def events(x_token:str|None=Header(default=None)):
     auth(x_token);return [dict(r) for r in db.execute('SELECT * FROM events ORDER BY id DESC LIMIT 100')]
