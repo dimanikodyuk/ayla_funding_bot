@@ -15,6 +15,7 @@ from .research_lab import research_report
 from .telegram import notify
 from .intelligence import classify, aggregate, signal_summary, premium_series, system_health, daily_report
 from .signal_validation import evaluate, threshold_preview
+from .market_data import ticker_snapshot, fresh_quote, spread_pct, MAX_QUOTE_AGE_SECONDS
 
 load_dotenv(); CFG=Config();db=connect();client=BingX();engine=PaperEngine(db,CFG)
 TRADE_WINDOW_MINUTES=360
@@ -24,6 +25,7 @@ hist=defaultdict(lambda:deque(maxlen=1440)); hist_minutes=defaultdict(lambda:deq
 history_progress_cache={'ts':0,'data':{}}
 last_diagnostics_bucket = -1
 last_saved = {}
+market_health={'ticker_last_success':0,'ticker_last_error':None,'ticker_valid_books':0,'ticker_rejected':0,'book_fallback_ok':0,'book_fallback_fail':0,'last_paper_check':0,'paper_blockers':{}}
 startup_time=int(time.time()); recovery_pending=bool(engine.positions()); last_volume=0; volumes={};last_book=0
 
 def event(level,message):
@@ -55,11 +57,25 @@ async def collect():
         try:
             now=int(time.time())
             raw=normalize(await client.premiums())
-            if now-last_volume>=60:
-                tickers=normalize(await client.ticker())
-                volumes.clear()
-                volumes.update({str(x.get('symbol')):D(x.get('quoteVolume') or x.get('quoteVolume24h') or '0') for x in tickers if isinstance(x,dict)})
-                last_volume=now
+            # One public ticker request supplies Bid/Ask for the whole market.
+            # A ticker failure does not interrupt premium collection; old quotes
+            # are never eligible for opening or closing paper positions.
+            try:
+                ticker_rows=normalize(await client.ticker())
+                tick_ts=int(time.time())
+                fresh, new_volumes, rejected=ticker_snapshot(ticker_rows,tick_ts)
+                if fresh:
+                    quotes.update(fresh)
+                    volumes.update(new_volumes)
+                    market_health.update(ticker_last_success=tick_ts,ticker_last_error=None,
+                        ticker_valid_books=len(fresh),ticker_rejected=rejected)
+                else:
+                    market_health['ticker_last_error']='No valid ticker books'
+            except Exception as exc:
+                market_health['ticker_last_error']=str(exc)[:160]
+            # Remove stale books from the shared cache, including previous targets.
+            for sym in list(quotes):
+                if not fresh_quote(quotes,sym,int(time.time())): quotes.pop(sym,None)
             candidates=[]; count=0; eligible=[]
             for item in raw:
                 try:
@@ -98,17 +114,30 @@ async def collect():
                         candidates.append({'symbol':sym,'premium':round(float(p),4),'z':round(z,3) if z is not None else None,'volume':float(vol),'mark':str(mark),'signal':'WARMING_UP' if z is None else 'OBSERVE', 'trade_history':{'ready':trade_ready,'observed_minutes':len(recent),'required_minutes':TRADE_REQUIRED_MINUTES,'window_minutes':TRADE_WINDOW_MINUTES,'coverage_percent':round(len(recent)/TRADE_WINDOW_MINUTES*100,1)}})
                 except (KeyError,TypeError,ValueError,ArithmeticError,ZeroDivisionError):continue
             db.commit()
-            # Book requests are limited to top 10 active/interesting symbols per cycle.
-            targets=[x[0] for x in sorted(eligible,key=lambda x:x[1],reverse=True)[:8]]
-            targets=list(dict.fromkeys([p['symbol'] for p in engine.positions()]+targets))[:12]
+            # Freshness and spread are calculated for every eligible ticker.
+            for sym, *_ in eligible:
+                q=fresh_quote(quotes,sym,int(time.time()))
+                if q: stats[sym]['spread']=spread_pct(q)
+            # Optional bookTicker refinement: open positions first, then the
+            # strongest statistical candidates. Failure retains fresh ticker.
+            positions=engine.positions()
+            near=[x for x in eligible if x[2] is not None and abs(float(x[2]))>=1.5]
+            targets=list(dict.fromkeys([p['symbol'] for p in positions]+[
+                x[0] for x in sorted(near,key=lambda x:x[1],reverse=True)[:6]]))[:10]
             for sym in targets:
                 try:
                     book=book_prices(await client.book(sym))
                     if book:
-                        bid,ask=book;quotes[sym]={'bid':str(bid),'ask':str(ask),'ts':int(time.time())}
-                        spread=(ask-bid)/((ask+bid)/2)*100
-                        stats[sym]['spread']=float(spread)
-                except Exception:continue
+                        bid,ask=book
+                        quotes[sym]={'bid':str(bid),'ask':str(ask),'ts':int(time.time()),'source':'bookTicker'}
+                        if sym in stats:stats[sym]['spread']=spread_pct(quotes[sym])
+                        market_health['book_fallback_ok']+=1
+                    else:market_health['book_fallback_fail']+=1
+                except Exception:
+                    market_health['book_fallback_fail']+=1
+            # Never use stale quotes for recovery, management or paper entries.
+            for sym in list(quotes):
+                if not fresh_quote(quotes,sym,int(time.time())):quotes.pop(sym,None)
             if recovery_pending:
                 recovered=engine.recovery(quotes)
                 for sym,pnl in recovered:
@@ -117,35 +146,47 @@ async def collect():
             for sym,reason,pnl in engine.manage(quotes,stats):
                 event('INFO',f'CLOSE {sym} {reason} PnL={pnl}');await notify(f'Закрито {sym}: {reason}; PnL {pnl} USDT')
             if setting(db,'paper_enabled','0')=='1' and not recovery_pending:
+                market_health['last_paper_check']=int(time.time())
+                blockers={'NO_Z':0,'NO_FRESH_BOOK':0,'FUNDING_GUARD':0,'SIGNAL_FILTER':0,'RISK_OR_EXECUTION':0,'OPENED':0}
                 for sym,_,z,p,vol,mom in sorted(eligible,key=lambda x:x[1],reverse=True):
-                    if z is None or sym not in quotes:continue
-                    q=quotes[sym]
-                    if now-q['ts']>5:continue
+                    if z is None: blockers['NO_Z']+=1;continue
+                    q=fresh_quote(quotes,sym,int(time.time()))
+                    if q is None: blockers['NO_FRESH_BOOK']+=1;continue
                     spread=stats[sym].get('spread',999)
                     # Conservative: unknown funding schedule means no entries.
                     funding_time=item_funding_minutes(sym,raw,now)
                     # No funding settlement simulation yet: reject trades that could cross settlement.
-                    if funding_time <= CFG.max_minutes + 5:continue
+                    if funding_time <= CFG.max_minutes + 5: blockers['FUNDING_GUARD']+=1;continue
                     side=signal(p,z,vol,spread,mom,funding_time,delta=stats[sym]['delta'])
                     if side:
+                        # Revalidate immediately before the simulated fill.
+                        q=fresh_quote(quotes,sym,int(time.time()))
+                        if q is None: blockers['NO_FRESH_BOOK']+=1;continue
                         trade_id,why=engine.open(sym,side,q['bid'],q['ask'])
+                        if not trade_id: blockers['RISK_OR_EXECUTION']+=1
                         if trade_id:
+                            blockers['OPENED']+=1
                             engine.log_signal(sym,side,z,float(p),'PAPER_OPEN')
                             event('INFO',f'OPEN {side} {sym} #{trade_id} z={z:.2f}')
                             await notify(f'PAPER {side} {sym} #{trade_id}; Z={z:.2f}')
                             break
+                    else: blockers['SIGNAL_FILTER']+=1
+                market_health['paper_blockers']=blockers
             # Read-only diagnostics; never changes trading decisions or order execution.
             diagnostics=[]
             for c in candidates:
                 sym=c['symbol']
                 st=stats.get(sym,{})
                 minutes=item_funding_minutes(sym,raw,now)
-                reason=classify(c,quotes.get(sym),st,minutes,CFG,engine.can_open,now)
+                current_book=fresh_quote(quotes,sym,int(time.time()))
+                reason=classify(c,current_book,st,minutes,CFG,engine.can_open,int(time.time()))
                 c['reason']=reason
                 c['spread']=round(st['spread'],4) if 'spread' in st else None
                 c['momentum']=round(st.get('momentum',0),3)
                 c['funding_minutes']=round(minutes,1) if minutes>=0 else None
-                c.update(evaluate(c,quotes.get(sym),st,minutes,CFG,engine.can_open,now))
+                c.update(evaluate(c,current_book,st,minutes,CFG,engine.can_open,int(time.time())))
+                c['book_source']=current_book.get('source') if current_book else None
+                c['book_age_seconds']=max(0,int(time.time())-current_book['ts']) if current_book else None
                 diagnostics.append(c)
             bucket=now//300
             if bucket != last_diagnostics_bucket:
@@ -238,7 +279,7 @@ async def status(x_token:str|None=Header(default=None)):
             unreal+=(D('1') if p['side']=='LONG' else D('-1'))*D(p['qty'])*(px-D(p['entry']))-D(p['fee_open'])-D(p['qty'])*px*CFG.fee_rate
     progress = history_progress([c['symbol'] for c in state['candidates']])
     candidates = [{**c, 'history': c.get('trade_history'), 'history_24h': progress.get(c['symbol'])} for c in state['candidates']]
-    return {**state, 'candidates': candidates, 'history_window_hours': 6, 'history_required_coverage_pct': 80, 'trade_history_required_minutes': TRADE_REQUIRED_MINUTES, 'history_diagnostics_window_hours':24, 'mode':'RECOVERING' if recovery_pending else ('PAPER_ACTIVE' if setting(db,'paper_enabled','0')=='1' else 'COLLECTING'),'paper_execution':'ENABLED' if setting(db,'paper_enabled','0')=='1' else 'PAUSED','balance':str(balance),'equity':str(balance+unreal),'realized_pnl':str(engine.realized()),'unrealized_pnl':str(unreal),'open_positions':len(pos),'strategy':'premium-mean-reversion','live_execution':'DISABLED'}
+    return {**state, 'candidates': candidates, 'history_window_hours': 6, 'history_required_coverage_pct': 80, 'trade_history_required_minutes': TRADE_REQUIRED_MINUTES, 'history_diagnostics_window_hours':24, 'market_data':{**market_health,'ticker_age_seconds':int(time.time())-market_health['ticker_last_success'] if market_health['ticker_last_success'] else None}, 'mode':'RECOVERING' if recovery_pending else ('PAPER_ACTIVE' if setting(db,'paper_enabled','0')=='1' else 'COLLECTING'),'paper_execution':'ENABLED' if setting(db,'paper_enabled','0')=='1' else 'PAUSED','balance':str(balance),'equity':str(balance+unreal),'realized_pnl':str(engine.realized()),'unrealized_pnl':str(unreal),'open_positions':len(pos),'strategy':'premium-mean-reversion','live_execution':'DISABLED'}
 
 @app.get('/api/trades')
 async def trades(x_token:str|None=Header(default=None)):
@@ -263,7 +304,7 @@ async def intelligence(x_token:str|None=Header(default=None)):
          'premium':c.get('premium'),'delta':c.get('delta'),
          'spread':c.get('spread'),'funding_minutes':c.get('funding_minutes'),
          'failures':c.get('failures',[]),'data_ts':c.get('data_ts'),
-         'eligible':c.get('eligible',False)} for c in state['candidates']]
+         'eligible':c.get('eligible',False),'book_source':c.get('book_source'),'book_age_seconds':c.get('book_age_seconds')} for c in state['candidates']]
     return {'reasons':signal_summary(db,24), 'reasons_1h':signal_summary(db,1),
             'reasons_24h':signal_summary(db,24),
             'recent':recent,'snapshot_ts':state['last_update'],
