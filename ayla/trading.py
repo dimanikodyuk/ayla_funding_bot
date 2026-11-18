@@ -42,6 +42,14 @@ class PaperEngine:
                 (trade['id'],now,event,st.get('z'),st.get('premium'),str(q['bid']),str(q['ask']),
                  str(net),max(0,now-trade['opened']),reason))
 
+    def decision(self,trade_id,event):
+        row=self.db.execute('SELECT * FROM exit_decisions WHERE trade_id=? AND event=? ORDER BY id DESC LIMIT 1',(trade_id,event)).fetchone()
+        return dict(row) if row else {}
+
+    def trade_by_id(self,trade_id):
+        row=self.db.execute('SELECT * FROM trades WHERE id=?',(trade_id,)).fetchone()
+        return dict(row) if row else None
+
     def today_pnl(self):
         from datetime import datetime
         from zoneinfo import ZoneInfo

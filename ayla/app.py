@@ -13,7 +13,7 @@ from .bingx import BingX
 from .trading import PaperEngine
 from .history_intelligence import history_detail
 from .research_lab import research_report
-from .telegram import notify
+from .telegram import notify,notify_trade
 from .intelligence import classify, aggregate, signal_summary, premium_series, system_health, daily_report
 from .signal_validation import evaluate, threshold_preview
 from .market_data import ticker_snapshot, fresh_quote, spread_pct, MAX_QUOTE_AGE_SECONDS
@@ -144,10 +144,17 @@ async def collect():
                 if recovery_pending:
                     recovered=engine.recovery(quotes)
                     for sym,pnl in recovered:
-                        event('WARNING',f'RECOVERY_GAP {sym} PnL={pnl}');await notify(f'⚠️ Recovery gap: {sym} PnL {pnl}')
+                        event('WARNING',f'RECOVERY_GAP {sym} PnL={pnl}')
+                        closed=next((t for t in engine.closed(20) if t['symbol']==sym and t['reason']=='RECOVERY_GAP'),None)
+                        if closed:await notify_trade(closed,engine.decision(closed['id'],'ENTRY'))
+                        else:await notify(f'⚠️ Recovery gap: {sym} PnL {pnl}')
                     if not engine.positions():recovery_pending=False
                 for sym,reason,pnl in engine.manage(quotes,stats):
-                    event('INFO',f'CLOSE {sym} {reason} PnL={pnl}');await notify(f'Закрито {sym}: {reason}; PnL {pnl} USDT')
+                    event('INFO',f'CLOSE {sym} {reason} PnL={pnl}')
+                    closed=next((t for t in engine.closed(20) if t['symbol']==sym and t['reason']==reason),None)
+                    if closed:
+                        await notify_trade(closed,engine.decision(closed['id'],'ENTRY'),engine.decision(closed['id'],'EXIT'))
+                    else:await notify(f'Закрито {sym}: {reason}; PnL {pnl} USDT')
                 if setting(db,'paper_enabled','0')=='1' and not recovery_pending:
                     market_health['last_paper_check']=int(time.time())
                     blockers={'NO_Z':0,'NO_FRESH_BOOK':0,'FUNDING_GUARD':0,'SIGNAL_FILTER':0,'RISK_OR_EXECUTION':0,'OPENED':0}
@@ -172,7 +179,7 @@ async def collect():
                                 blockers['OPENED']+=1
                                 engine.log_signal(sym,side,z,float(p),'PAPER_OPEN')
                                 event('INFO',f'OPEN {side} {sym} #{trade_id} z={z:.2f}')
-                                await notify(f'PAPER {side} {sym} #{trade_id}; Z={z:.2f}')
+                                await notify_trade(engine.trade_by_id(trade_id),engine.decision(trade_id,'ENTRY'))
                                 break
                         else: blockers['SIGNAL_FILTER']+=1
                     market_health['paper_blockers']=blockers

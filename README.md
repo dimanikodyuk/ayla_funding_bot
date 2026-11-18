@@ -105,3 +105,13 @@
 - Paper reset in Trades tab: balance, trades, all. Requires Paper paused and no open/recovering positions; creates a consistent SQLite backup in `data/backups/` before each reset. `balance_offset` in `paper_state` preserves balance semantics.
 - Market samples, signal diagnostics, configuration, Telegram and `.env` are not deleted by reset.
 - Reset requires X-Token authentication and confirmation. Never affects live orders (none supported).
+
+
+## v3.5 — Trade Intelligence / Telegram Widgets
+
+- On each Paper OPEN/CLOSE, the bot attempts `sendWidget` (Bot API 10.4) with a self-contained HTML card and a tap-to-expand details section. This requires Telegram server and client support for layer 233.
+- If the API does not support `sendWidget` or widget delivery fails, the bot sends a text message instead; there is no file attachment and no Mini App.
+- `TELEGRAM_WIDGETS_ENABLED=0` disables widget attempts (default: enabled). Existing `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are reused. Do not paste credentials into the source.
+- `entry_z` / `exit_z` and premium are read from v3.4's `exit_decisions` table. Historical trades before v3.4 may have missing values; no fake data is filled in.
+- Existing trade exit rules, balances, reset controls, database files and strategy parameters remain unchanged.
+- Check service logs for `Telegram sendWidget unavailable` if the text fallback is used.
