@@ -1,7 +1,8 @@
-import asyncio, os, time, statistics
+import asyncio, os, time, statistics, sqlite3
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from pathlib import Path
+from datetime import datetime, timezone
 from decimal import Decimal
 from fastapi import FastAPI,HTTPException,Header
 from fastapi.responses import HTMLResponse
@@ -26,6 +27,7 @@ history_progress_cache={'ts':0,'data':{}}
 last_diagnostics_bucket = -1
 last_saved = {}
 market_health={'ticker_last_success':0,'ticker_last_error':None,'ticker_valid_books':0,'ticker_rejected':0,'book_fallback_ok':0,'book_fallback_fail':0,'last_paper_check':0,'paper_blockers':{}}
+cycle_lock=asyncio.Lock()
 startup_time=int(time.time()); recovery_pending=bool(engine.positions()); last_volume=0; volumes={};last_book=0
 
 def event(level,message):
@@ -54,147 +56,149 @@ async def collect():
     await asyncio.sleep(1)
     tick=0
     while True:
-        try:
-            now=int(time.time())
-            raw=normalize(await client.premiums())
-            # One public ticker request supplies Bid/Ask for the whole market.
-            # A ticker failure does not interrupt premium collection; old quotes
-            # are never eligible for opening or closing paper positions.
+        async with cycle_lock:
             try:
-                ticker_rows=normalize(await client.ticker())
-                tick_ts=int(time.time())
-                fresh, new_volumes, rejected=ticker_snapshot(ticker_rows,tick_ts)
-                if fresh:
-                    quotes.update(fresh)
-                    volumes.update(new_volumes)
-                    market_health.update(ticker_last_success=tick_ts,ticker_last_error=None,
-                        ticker_valid_books=len(fresh),ticker_rejected=rejected)
-                else:
-                    market_health['ticker_last_error']='No valid ticker books'
-            except Exception as exc:
-                market_health['ticker_last_error']=str(exc)[:160]
-            # Remove stale books from the shared cache, including previous targets.
-            for sym in list(quotes):
-                if not fresh_quote(quotes,sym,int(time.time())): quotes.pop(sym,None)
-            candidates=[]; count=0; eligible=[]
-            for item in raw:
+                now=int(time.time())
+                raw=normalize(await client.premiums())
+                # One public ticker request supplies Bid/Ask for the whole market.
+                # A ticker failure does not interrupt premium collection; old quotes
+                # are never eligible for opening or closing paper positions.
                 try:
-                    sym=str(item['symbol']);mark=D(item['markPrice']);idx=D(item['indexPrice'])
-                    if not sym.endswith('-USDT') or mark<=0 or idx<=0:continue
-                    count+=1;p=premium(mark,idx);history=hist[sym]
-                    vol=volumes.get(sym,D(0))
-                    # One observation per minute for a time-balanced 24h Z-score.
-                    minute=now//60
-                    while hist_minutes[sym] and hist_minutes[sym][0] < minute-1439:
-                        hist_minutes[sym].popleft(); history.popleft()
-                    # The trading model uses only the last 6h of real minute buckets.
-                    # The 24h history remains intact for the Research Lab and diagnostics.
-                    trade_minutes=[(m,v) for m,v in zip(hist_minutes[sym],history) if minute-TRADE_WINDOW_MINUTES+1<=m<=minute]
-                    recent=[v for m,v in trade_minutes if m<minute]
-                    last_minute=trade_minutes[-1][0] if trade_minutes else None
-                    first_minute=trade_minutes[0][0] if trade_minutes else None
-                    trade_ready=bool(len(recent)>=TRADE_REQUIRED_MINUTES and
-                        first_minute is not None and minute-first_minute>=TRADE_REQUIRED_MINUTES and
-                        last_minute is not None and minute-last_minute<=2)
-                    z=zscore(p,recent,min_samples=TRADE_REQUIRED_MINUTES) if trade_ready else None
-                    mean=sum(recent)/len(recent) if z is not None else p
-                    delta=p-mean
-                    if not hist_minutes[sym] or hist_minutes[sym][-1]!=minute:
-                        history.append(p); hist_minutes[sym].append(minute)
-                    # No modulo-of-wall-clock gate: a slow REST cycle must not silently lose samples.
-                    if now-last_saved.get(sym,0)>=30:
-                        db.execute('INSERT OR IGNORE INTO samples VALUES(?,?,?,?,?)',(sym,now,float(p),float(mark),float(idx)))
-                        last_saved[sym]=now
-                    momentum[sym].append((now,idx))
-                    old=next((v for t,v in momentum[sym] if now-t>=55),None)
-                    mom=float((idx/old-1)*100) if old else 0.0
-                    stats[sym]={'z':z,'premium':float(p),'delta':float(delta),'momentum':mom}
-                    if vol>=CFG.min_volume:
-                        eligible.append((sym,abs(float(delta)),z,p,vol,mom))
-                        candidates.append({'symbol':sym,'premium':round(float(p),4),'z':round(z,3) if z is not None else None,'volume':float(vol),'mark':str(mark),'signal':'WARMING_UP' if z is None else 'OBSERVE', 'trade_history':{'ready':trade_ready,'observed_minutes':len(recent),'required_minutes':TRADE_REQUIRED_MINUTES,'window_minutes':TRADE_WINDOW_MINUTES,'coverage_percent':round(len(recent)/TRADE_WINDOW_MINUTES*100,1)}})
-                except (KeyError,TypeError,ValueError,ArithmeticError,ZeroDivisionError):continue
-            db.commit()
-            # Freshness and spread are calculated for every eligible ticker.
-            for sym, *_ in eligible:
-                q=fresh_quote(quotes,sym,int(time.time()))
-                if q: stats[sym]['spread']=spread_pct(q)
-            # Optional bookTicker refinement: open positions first, then the
-            # strongest statistical candidates. Failure retains fresh ticker.
-            positions=engine.positions()
-            near=[x for x in eligible if x[2] is not None and abs(float(x[2]))>=1.5]
-            targets=list(dict.fromkeys([p['symbol'] for p in positions]+[
-                x[0] for x in sorted(near,key=lambda x:x[1],reverse=True)[:6]]))[:10]
-            for sym in targets:
-                try:
-                    book=book_prices(await client.book(sym))
-                    if book:
-                        bid,ask=book
-                        quotes[sym]={'bid':str(bid),'ask':str(ask),'ts':int(time.time()),'source':'bookTicker'}
-                        if sym in stats:stats[sym]['spread']=spread_pct(quotes[sym])
-                        market_health['book_fallback_ok']+=1
-                    else:market_health['book_fallback_fail']+=1
-                except Exception:
-                    market_health['book_fallback_fail']+=1
-            # Never use stale quotes for recovery, management or paper entries.
-            for sym in list(quotes):
-                if not fresh_quote(quotes,sym,int(time.time())):quotes.pop(sym,None)
-            if recovery_pending:
-                recovered=engine.recovery(quotes)
-                for sym,pnl in recovered:
-                    event('WARNING',f'RECOVERY_GAP {sym} PnL={pnl}');await notify(f'⚠️ Recovery gap: {sym} PnL {pnl}')
-                if not engine.positions():recovery_pending=False
-            for sym,reason,pnl in engine.manage(quotes,stats):
-                event('INFO',f'CLOSE {sym} {reason} PnL={pnl}');await notify(f'Закрито {sym}: {reason}; PnL {pnl} USDT')
-            if setting(db,'paper_enabled','0')=='1' and not recovery_pending:
-                market_health['last_paper_check']=int(time.time())
-                blockers={'NO_Z':0,'NO_FRESH_BOOK':0,'FUNDING_GUARD':0,'SIGNAL_FILTER':0,'RISK_OR_EXECUTION':0,'OPENED':0}
-                for sym,_,z,p,vol,mom in sorted(eligible,key=lambda x:x[1],reverse=True):
-                    if z is None: blockers['NO_Z']+=1;continue
+                    ticker_rows=normalize(await client.ticker())
+                    tick_ts=int(time.time())
+                    fresh, new_volumes, rejected=ticker_snapshot(ticker_rows,tick_ts)
+                    if fresh:
+                        quotes.update(fresh)
+                        volumes.update(new_volumes)
+                        market_health.update(ticker_last_success=tick_ts,ticker_last_error=None,
+                            ticker_valid_books=len(fresh),ticker_rejected=rejected)
+                    else:
+                        market_health['ticker_last_error']='No valid ticker books'
+                except Exception as exc:
+                    market_health['ticker_last_error']=str(exc)[:160]
+                # Remove stale books from the shared cache, including previous targets.
+                for sym in list(quotes):
+                    if not fresh_quote(quotes,sym,int(time.time())): quotes.pop(sym,None)
+                candidates=[]; count=0; eligible=[]
+                for item in raw:
+                    try:
+                        sym=str(item['symbol']);mark=D(item['markPrice']);idx=D(item['indexPrice'])
+                        if not sym.endswith('-USDT') or mark<=0 or idx<=0:continue
+                        count+=1;p=premium(mark,idx);history=hist[sym]
+                        vol=volumes.get(sym,D(0))
+                        # One observation per minute for a time-balanced 24h Z-score.
+                        minute=now//60
+                        while hist_minutes[sym] and hist_minutes[sym][0] < minute-1439:
+                            hist_minutes[sym].popleft(); history.popleft()
+                        # The trading model uses only the last 6h of real minute buckets.
+                        # The 24h history remains intact for the Research Lab and diagnostics.
+                        trade_minutes=[(m,v) for m,v in zip(hist_minutes[sym],history) if minute-TRADE_WINDOW_MINUTES+1<=m<=minute]
+                        recent=[v for m,v in trade_minutes if m<minute]
+                        last_minute=trade_minutes[-1][0] if trade_minutes else None
+                        first_minute=trade_minutes[0][0] if trade_minutes else None
+                        trade_ready=bool(len(recent)>=TRADE_REQUIRED_MINUTES and
+                            first_minute is not None and minute-first_minute>=TRADE_REQUIRED_MINUTES and
+                            last_minute is not None and minute-last_minute<=2)
+                        z=zscore(p,recent,min_samples=TRADE_REQUIRED_MINUTES) if trade_ready else None
+                        mean=sum(recent)/len(recent) if z is not None else p
+                        delta=p-mean
+                        if not hist_minutes[sym] or hist_minutes[sym][-1]!=minute:
+                            history.append(p); hist_minutes[sym].append(minute)
+                        # No modulo-of-wall-clock gate: a slow REST cycle must not silently lose samples.
+                        if now-last_saved.get(sym,0)>=30:
+                            db.execute('INSERT OR IGNORE INTO samples VALUES(?,?,?,?,?)',(sym,now,float(p),float(mark),float(idx)))
+                            last_saved[sym]=now
+                        momentum[sym].append((now,idx))
+                        old=next((v for t,v in momentum[sym] if now-t>=55),None)
+                        mom=float((idx/old-1)*100) if old else 0.0
+                        stats[sym]={'z':z,'premium':float(p),'delta':float(delta),'momentum':mom}
+                        if vol>=CFG.min_volume:
+                            eligible.append((sym,abs(float(delta)),z,p,vol,mom))
+                            candidates.append({'symbol':sym,'premium':round(float(p),4),'z':round(z,3) if z is not None else None,'volume':float(vol),'mark':str(mark),'signal':'WARMING_UP' if z is None else 'OBSERVE', 'trade_history':{'ready':trade_ready,'observed_minutes':len(recent),'required_minutes':TRADE_REQUIRED_MINUTES,'window_minutes':TRADE_WINDOW_MINUTES,'coverage_percent':round(len(recent)/TRADE_WINDOW_MINUTES*100,1)}})
+                    except (KeyError,TypeError,ValueError,ArithmeticError,ZeroDivisionError):continue
+                db.commit()
+                # Freshness and spread are calculated for every eligible ticker.
+                for sym, *_ in eligible:
                     q=fresh_quote(quotes,sym,int(time.time()))
-                    if q is None: blockers['NO_FRESH_BOOK']+=1;continue
-                    spread=stats[sym].get('spread',999)
-                    # Conservative: unknown funding schedule means no entries.
-                    funding_time=item_funding_minutes(sym,raw,now)
-                    # No funding settlement simulation yet: reject trades that could cross settlement.
-                    if funding_time <= CFG.max_minutes + 5: blockers['FUNDING_GUARD']+=1;continue
-                    side=signal(p,z,vol,spread,mom,funding_time,delta=stats[sym]['delta'])
-                    if side:
-                        # Revalidate immediately before the simulated fill.
+                    if q: stats[sym]['spread']=spread_pct(q)
+                # Optional bookTicker refinement: open positions first, then the
+                # strongest statistical candidates. Failure retains fresh ticker.
+                positions=engine.positions()
+                near=[x for x in eligible if x[2] is not None and abs(float(x[2]))>=1.5]
+                targets=list(dict.fromkeys([p['symbol'] for p in positions]+[
+                    x[0] for x in sorted(near,key=lambda x:x[1],reverse=True)[:6]]))[:10]
+                for sym in targets:
+                    try:
+                        book=book_prices(await client.book(sym))
+                        if book:
+                            bid,ask=book
+                            quotes[sym]={'bid':str(bid),'ask':str(ask),'ts':int(time.time()),'source':'bookTicker'}
+                            if sym in stats:stats[sym]['spread']=spread_pct(quotes[sym])
+                            market_health['book_fallback_ok']+=1
+                        else:market_health['book_fallback_fail']+=1
+                    except Exception:
+                        market_health['book_fallback_fail']+=1
+                # Never use stale quotes for recovery, management or paper entries.
+                for sym in list(quotes):
+                    if not fresh_quote(quotes,sym,int(time.time())):quotes.pop(sym,None)
+                if recovery_pending:
+                    recovered=engine.recovery(quotes)
+                    for sym,pnl in recovered:
+                        event('WARNING',f'RECOVERY_GAP {sym} PnL={pnl}');await notify(f'⚠️ Recovery gap: {sym} PnL {pnl}')
+                    if not engine.positions():recovery_pending=False
+                for sym,reason,pnl in engine.manage(quotes,stats):
+                    event('INFO',f'CLOSE {sym} {reason} PnL={pnl}');await notify(f'Закрито {sym}: {reason}; PnL {pnl} USDT')
+                if setting(db,'paper_enabled','0')=='1' and not recovery_pending:
+                    market_health['last_paper_check']=int(time.time())
+                    blockers={'NO_Z':0,'NO_FRESH_BOOK':0,'FUNDING_GUARD':0,'SIGNAL_FILTER':0,'RISK_OR_EXECUTION':0,'OPENED':0}
+                    for sym,_,z,p,vol,mom in sorted(eligible,key=lambda x:x[1],reverse=True):
+                        if z is None: blockers['NO_Z']+=1;continue
                         q=fresh_quote(quotes,sym,int(time.time()))
                         if q is None: blockers['NO_FRESH_BOOK']+=1;continue
-                        trade_id,why=engine.open(sym,side,q['bid'],q['ask'])
-                        if not trade_id: blockers['RISK_OR_EXECUTION']+=1
-                        if trade_id:
-                            blockers['OPENED']+=1
-                            engine.log_signal(sym,side,z,float(p),'PAPER_OPEN')
-                            event('INFO',f'OPEN {side} {sym} #{trade_id} z={z:.2f}')
-                            await notify(f'PAPER {side} {sym} #{trade_id}; Z={z:.2f}')
-                            break
-                    else: blockers['SIGNAL_FILTER']+=1
-                market_health['paper_blockers']=blockers
-            # Read-only diagnostics; never changes trading decisions or order execution.
-            diagnostics=[]
-            for c in candidates:
-                sym=c['symbol']
-                st=stats.get(sym,{})
-                minutes=item_funding_minutes(sym,raw,now)
-                current_book=fresh_quote(quotes,sym,int(time.time()))
-                reason=classify(c,current_book,st,minutes,CFG,engine.can_open,int(time.time()))
-                c['reason']=reason
-                c['spread']=round(st['spread'],4) if 'spread' in st else None
-                c['momentum']=round(st.get('momentum',0),3)
-                c['funding_minutes']=round(minutes,1) if minutes>=0 else None
-                c.update(evaluate(c,current_book,st,minutes,CFG,engine.can_open,int(time.time())))
-                c['book_source']=current_book.get('source') if current_book else None
-                c['book_age_seconds']=max(0,int(time.time())-current_book['ts']) if current_book else None
-                diagnostics.append(c)
-            bucket=now//300
-            if bucket != last_diagnostics_bucket:
-                aggregate(db,diagnostics,now)
-                last_diagnostics_bucket=bucket
-            state.update(connected=True,last_update=now,error=None,markets=count,qualified=len(eligible),candidates=sorted(candidates,key=lambda x:abs(x['z'] or 0),reverse=True)[:100],last_cycle=now)
-        except Exception as exc:
-            state.update(connected=False,error=str(exc));event('ERROR',f'collector: {exc}')
+                        spread=stats[sym].get('spread',999)
+                        # Conservative: unknown funding schedule means no entries.
+                        funding_time=item_funding_minutes(sym,raw,now)
+                        # No funding settlement simulation yet: reject trades that could cross settlement.
+                        if funding_time <= CFG.max_minutes + 5: blockers['FUNDING_GUARD']+=1;continue
+                        side=signal(p,z,vol,spread,mom,funding_time,delta=stats[sym]['delta'])
+                        if side:
+                            # Revalidate immediately before the simulated fill.
+                            q=fresh_quote(quotes,sym,int(time.time()))
+                            if q is None: blockers['NO_FRESH_BOOK']+=1;continue
+                            trade_id,why=engine.open(sym,side,q['bid'],q['ask'])
+                            if not trade_id: blockers['RISK_OR_EXECUTION']+=1
+                            if trade_id:
+                                engine.record_exit(next(t for t in engine.positions() if t['id']==trade_id),q,stats[sym],int(time.time()),'ENTRY','PAPER_OPEN',engine.net_exit_pnl(next(t for t in engine.positions() if t['id']==trade_id),q['bid'],q['ask']))
+                                blockers['OPENED']+=1
+                                engine.log_signal(sym,side,z,float(p),'PAPER_OPEN')
+                                event('INFO',f'OPEN {side} {sym} #{trade_id} z={z:.2f}')
+                                await notify(f'PAPER {side} {sym} #{trade_id}; Z={z:.2f}')
+                                break
+                        else: blockers['SIGNAL_FILTER']+=1
+                    market_health['paper_blockers']=blockers
+                # Read-only diagnostics; never changes trading decisions or order execution.
+                diagnostics=[]
+                for c in candidates:
+                    sym=c['symbol']
+                    st=stats.get(sym,{})
+                    minutes=item_funding_minutes(sym,raw,now)
+                    current_book=fresh_quote(quotes,sym,int(time.time()))
+                    reason=classify(c,current_book,st,minutes,CFG,engine.can_open,int(time.time()))
+                    c['reason']=reason
+                    c['spread']=round(st['spread'],4) if 'spread' in st else None
+                    c['momentum']=round(st.get('momentum',0),3)
+                    c['funding_minutes']=round(minutes,1) if minutes>=0 else None
+                    c.update(evaluate(c,current_book,st,minutes,CFG,engine.can_open,int(time.time())))
+                    c['book_source']=current_book.get('source') if current_book else None
+                    c['book_age_seconds']=max(0,int(time.time())-current_book['ts']) if current_book else None
+                    diagnostics.append(c)
+                bucket=now//300
+                if bucket != last_diagnostics_bucket:
+                    aggregate(db,diagnostics,now)
+                    last_diagnostics_bucket=bucket
+                state.update(connected=True,last_update=now,error=None,markets=count,qualified=len(eligible),candidates=sorted(candidates,key=lambda x:abs(x['z'] or 0),reverse=True)[:100],last_cycle=now)
+            except Exception as exc:
+                state.update(connected=False,error=str(exc));event('ERROR',f'collector: {exc}')
         await asyncio.sleep(5 if state['connected'] else 15)
 
 def item_funding_minutes(symbol,raw,now):
@@ -294,7 +298,8 @@ async def signals(x_token:str|None=Header(default=None)):
 async def paper(enabled:int,x_token:str|None=Header(default=None)):
     auth(x_token)
     if enabled not in (0,1):raise HTTPException(400,'enabled must be 0 or 1')
-    set_setting(db,'paper_enabled',enabled);event('INFO',f'Paper intent {enabled}')
+    async with cycle_lock:
+        set_setting(db,'paper_enabled',enabled);event('INFO',f'Paper intent {enabled}')
     return {'paper_requested':bool(enabled),'execution':'PAPER_ONLY','recovery_pending':recovery_pending}
 
 @app.get('/api/intelligence')
@@ -349,3 +354,49 @@ async def research(symbol:str,x_token:str|None=Header(default=None)):
     auth(x_token)
     try:return research_report(db,symbol)
     except ValueError:raise HTTPException(400,'Invalid symbol')
+
+
+@app.get('/api/exit-intelligence')
+async def exit_intelligence(x_token:str|None=Header(default=None)):
+    auth(x_token)
+    decisions=[dict(r) for r in db.execute('''SELECT e.*,t.symbol,t.side,t.status FROM exit_decisions e
+      LEFT JOIN trades t ON t.id=e.trade_id ORDER BY e.id DESC LIMIT 200''')]
+    return {'decisions':decisions,'note':'Read-only audit. NORMALIZED remains the original exit rule; no profit gating.'}
+
+@app.get('/api/exit-research')
+async def exit_research(x_token:str|None=Header(default=None)):
+    auth(x_token)
+    # Observational replay only: samples contain mark/index, NOT executable bid/ask.
+    # Do not present mark-based hypothetical returns as realized PnL.
+    from .exit_research import replay
+    return replay(db,CFG)
+
+@app.post('/api/paper-reset/{mode}')
+async def paper_reset(mode:str,x_token:str|None=Header(default=None)):
+    auth(x_token)
+    if mode not in ('balance','trades','all'):raise HTTPException(400,'Invalid reset mode')
+    async with cycle_lock:
+        if setting(db,'paper_enabled','0')=='1':raise HTTPException(409,'Pause Paper Trading first')
+        if engine.positions() or recovery_pending:raise HTTPException(409,'Close all paper positions first')
+        before=engine.balance()
+        backup_dir=Path('data/backups');backup_dir.mkdir(parents=True,exist_ok=True)
+        backup=backup_dir/('paper_before_reset_'+datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')+'.sqlite')
+        # SQLite online backup includes WAL-committed records, no copying live .sqlite files.
+        with sqlite3.connect(str(backup)) as target:db.backup(target)
+        try:
+            with db:
+                if mode in ('trades','all'):
+                    for table in ('paper_fills','funding_events','signal_log','exit_decisions','trades'):
+                        db.execute('DELETE FROM '+table)
+                # balance only: retain historical PnL but offset it to exactly initial_balance
+                if mode=='balance':offset=-engine.realized()
+                elif mode=='trades':offset=before-CFG.initial_balance
+                else:offset=D(0)
+                db.execute("INSERT INTO paper_state(key,value) VALUES('balance_offset',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(offset),))
+                db.execute('INSERT INTO paper_resets(ts,mode,balance_before,backup_path) VALUES(?,?,?,?)',
+                           (int(time.time()),mode,str(before),str(backup)))
+                db.execute('INSERT INTO events(ts,level,message) VALUES(?,?,?)',
+                           (int(time.time()),'WARNING',f'Paper reset {mode}; backup={backup}'))
+        except Exception:
+            raise
+        return {'ok':True,'mode':mode,'balance':str(engine.balance()),'backup':str(backup),'paper_enabled':False}

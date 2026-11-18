@@ -11,6 +11,15 @@ class PaperEngine:
         CREATE TABLE IF NOT EXISTS signal_log(id INTEGER PRIMARY KEY, ts INTEGER, symbol TEXT, side TEXT, z REAL, premium REAL, reason TEXT);
         CREATE TABLE IF NOT EXISTS paper_state(key TEXT PRIMARY KEY,value TEXT NOT NULL);
         ''')
+        self.db.executescript('''
+        CREATE TABLE IF NOT EXISTS exit_decisions(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,trade_id INTEGER NOT NULL,ts INTEGER NOT NULL,
+            event TEXT NOT NULL,z REAL,premium REAL,bid TEXT,ask TEXT,
+            net_pnl TEXT,hold_seconds INTEGER,reason TEXT,
+            UNIQUE(trade_id,ts,event));
+        CREATE INDEX IF NOT EXISTS ix_exit_decisions_trade ON exit_decisions(trade_id,ts);
+        CREATE TABLE IF NOT EXISTS paper_resets(id INTEGER PRIMARY KEY AUTOINCREMENT,ts INTEGER,mode TEXT,balance_before TEXT,backup_path TEXT);
+        ''')
         self.db.commit()
     def positions(self):
         return [dict(r) for r in self.db.execute("SELECT * FROM trades WHERE status='OPEN' ORDER BY id")]
@@ -18,7 +27,21 @@ class PaperEngine:
         return [dict(r) for r in self.db.execute("SELECT * FROM trades WHERE status='CLOSED' ORDER BY id DESC LIMIT ?",(limit,))]
     def realized(self):
         return sum((D(r['pnl']) for r in self.db.execute("SELECT pnl FROM trades WHERE status='CLOSED' AND pnl IS NOT NULL")),D(0))
-    def balance(self):return self.cfg.initial_balance+self.realized()
+    def balance(self):
+        row=self.db.execute("SELECT value FROM paper_state WHERE key='balance_offset'").fetchone()
+        return self.cfg.initial_balance + (D(row['value']) if row else D(0)) + self.realized()
+    def net_exit_pnl(self,trade,bid,ask):
+        bid,ask=D(bid),D(ask)
+        px=bid if trade['side']=='LONG' else ask
+        return trade_pnl(trade['side'],D(trade['qty']),D(trade['entry']),px)-D(trade['fee_open'])-D(trade['qty'])*px*self.cfg.fee_rate+D(trade['funding'] or 0)
+    def record_exit(self,trade,q,st,now,event,reason,net):
+        with self.db:
+            self.db.execute('''INSERT OR IGNORE INTO exit_decisions
+                (trade_id,ts,event,z,premium,bid,ask,net_pnl,hold_seconds,reason)
+                VALUES(?,?,?,?,?,?,?,?,?,?)''',
+                (trade['id'],now,event,st.get('z'),st.get('premium'),str(q['bid']),str(q['ask']),
+                 str(net),max(0,now-trade['opened']),reason))
+
     def today_pnl(self):
         from datetime import datetime
         from zoneinfo import ZoneInfo
@@ -74,7 +97,12 @@ class PaperEngine:
             if movement<=-self.cfg.stop_pct:reason='STOP_LOSS'
             elif now-trade['opened']>=self.cfg.max_minutes*60:reason='TIME_LIMIT'
             elif st.get('z') is not None and abs(st['z'])<=0.5:reason='NORMALIZED'
+            if reason=='NORMALIZED':
+                net=self.net_exit_pnl(trade,bid,ask)
+                self.record_exit(trade,q,st,now,'NORMALIZATION_OBSERVED',reason,net)
             if reason:
+                net=self.net_exit_pnl(trade,bid,ask)
+                self.record_exit(trade,q,st,now,'EXIT',reason,net)
                 pnl=self.close(trade,bid,ask,reason,now)
                 if pnl is not None:results.append((trade['symbol'],reason,str(pnl)))
         return results

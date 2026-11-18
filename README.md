@@ -97,3 +97,11 @@
 - Signal Intelligence показує джерело та вік котирування.
 - **Не змінено** пороги Z-score/премії, правила funding, ризик-менеджмент, 6-годинне вікно та PAPER ONLY.
 - Зміни не торкаються `.env`, SQLite та сесій. Установлювати лише змінені файли з патча.
+
+
+## v3.4 — Exit Intelligence & Paper Reset
+- Exit audit in `exit_decisions`: entry, normalization observations, executed exits; includes Z, premium, bid/ask, net PnL, hold duration. Original STOP_LOSS, TIME_LIMIT and NORMALIZED rules unchanged.
+- `/api/exit-research`: read-only observational mark-price proxy for 30/60/120 seconds; not an executable strategy backtest.
+- Paper reset in Trades tab: balance, trades, all. Requires Paper paused and no open/recovering positions; creates a consistent SQLite backup in `data/backups/` before each reset. `balance_offset` in `paper_state` preserves balance semantics.
+- Market samples, signal diagnostics, configuration, Telegram and `.env` are not deleted by reset.
+- Reset requires X-Token authentication and confirmation. Never affects live orders (none supported).
