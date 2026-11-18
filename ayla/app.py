@@ -14,6 +14,7 @@ from .history_intelligence import history_detail
 from .research_lab import research_report
 from .telegram import notify
 from .intelligence import classify, aggregate, signal_summary, premium_series, system_health, daily_report
+from .signal_validation import evaluate, threshold_preview
 
 load_dotenv(); CFG=Config();db=connect();client=BingX();engine=PaperEngine(db,CFG)
 TRADE_WINDOW_MINUTES=360
@@ -144,6 +145,7 @@ async def collect():
                 c['spread']=round(st['spread'],4) if 'spread' in st else None
                 c['momentum']=round(st.get('momentum',0),3)
                 c['funding_minutes']=round(minutes,1) if minutes>=0 else None
+                c.update(evaluate(c,quotes.get(sym),st,minutes,CFG,engine.can_open,now))
                 diagnostics.append(c)
             bucket=now//300
             if bucket != last_diagnostics_bucket:
@@ -257,10 +259,16 @@ async def paper(enabled:int,x_token:str|None=Header(default=None)):
 @app.get('/api/intelligence')
 async def intelligence(x_token:str|None=Header(default=None)):
     auth(x_token)
-    return {'reasons':signal_summary(db),'recent':[
-        {'symbol':c['symbol'],'reason':c.get('reason','UNKNOWN'),'z':c.get('z'),
-         'premium':c.get('premium'),'spread':c.get('spread'),'funding_minutes':c.get('funding_minutes')}
-        for c in state['candidates']]}
+    recent=[{'symbol':c['symbol'],'reason':c.get('reason','UNKNOWN'),'z':c.get('z'),
+         'premium':c.get('premium'),'delta':c.get('delta'),
+         'spread':c.get('spread'),'funding_minutes':c.get('funding_minutes'),
+         'failures':c.get('failures',[]),'data_ts':c.get('data_ts'),
+         'eligible':c.get('eligible',False)} for c in state['candidates']]
+    return {'reasons':signal_summary(db,24), 'reasons_1h':signal_summary(db,1),
+            'reasons_24h':signal_summary(db,24),
+            'recent':recent,'snapshot_ts':state['last_update'],
+            'threshold_preview':threshold_preview(recent),
+            'note':'Пороги — лише поточний зріз, не backtest і не дозвіл Paper.'}
 
 @app.get('/api/radar')
 async def radar(x_token:str|None=Header(default=None)):
