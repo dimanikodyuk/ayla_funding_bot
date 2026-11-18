@@ -3,6 +3,9 @@ import html as html_lib
 import os
 import zlib
 import logging
+import asyncio
+import json
+from decimal import Decimal, InvalidOperation
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import httpx
@@ -71,8 +74,10 @@ async def _send(method,payload):
             return False,str(result.get('description') or f'HTTP {response.status_code}')[:180]
     except (httpx.HTTPError,ValueError) as exc:return False,type(exc).__name__
 
-async def notify(message):
-    ok,error=await _send('sendMessage',{'text':str(message)[:3500]})
+async def notify(message, markup=None):
+    payload={'text':str(message)[:3500]}
+    if markup:payload['reply_markup']=markup
+    ok,error=await _send('sendMessage',payload)
     if not ok and error!='not_configured':log.warning('Telegram text delivery failed: %s',error)
     return ok
 
@@ -106,5 +111,92 @@ async def notify_trade(trade,entry=None,exit=None):
             ok,error=await _send('sendMessage',{'text':text,'reply_markup':{'inline_keyboard':[[{'text':'📈 Відкрити Trade Replay','url':public_url.rstrip('/')+'/#trades'}]]}})
             if ok:return 'inline_url'
             log.warning('Telegram inline URL failed (%s); text fallback',error)
-    await notify(text)
+    await notify(text, {'inline_keyboard':[[
+        {'text':'📊 Деталі та витрати','callback_data':f"ayla:cost:{int(trade['id'])}"},
+        {'text':'📈 Аналіз сигналу','callback_data':f"ayla:signal:{int(trade['id'])}"}
+    ]]})
     return 'text'
+
+
+# Telegram Bot API polling is separate from trading. Only read-only callbacks
+# are accepted; no callback can enable Paper Trading or place orders.
+def _money(v, places=4):
+    try:return f'{Decimal(str(v or 0)):+.{places}f}'
+    except (InvalidOperation,TypeError,ValueError):return '—'
+
+def _trade_detail(db, trade_id, section):
+    row=db.execute('SELECT * FROM trades WHERE id=?',(trade_id,)).fetchone()
+    if row is None:return '✅ Кнопки Telegram працюють. Угоди можна переглядати після наступного Paper-входу.'
+    t=dict(row)
+    title=f"🐾 PAPER #{t['id']} · {t['side']} {t['symbol']}"
+    if section=='cost':
+        qty=Decimal(str(t['qty']));entry=Decimal(str(t['entry']))
+        exit_price=Decimal(str(t['exit'])) if t.get('exit') is not None else None
+        gross=((exit_price-entry)*qty*(1 if t['side']=='LONG' else -1)) if exit_price is not None else None
+        fee_open=Decimal(str(t.get('fee_open') or 0));fee_close=Decimal(str(t.get('fee_close') or 0))
+        funding=Decimal(str(t.get('funding') or 0))
+        return (f'{title}\n\n💵 Витрати та результат\n'
+            f'Gross PnL: {_money(gross) if gross is not None else "—"} USDT\n'
+            f'Комісія входу: {_money(-fee_open)} USDT\n'
+            f'Комісія виходу: {_money(-fee_close) if exit_price is not None else "—"} USDT\n'
+            f'Funding: {_money(funding)} USDT\n'
+            f'Net PnL: {_money(t.get("pnl")) if exit_price is not None else "—"} USDT\n'
+            'Спред уже врахований у цінах Bid/Ask; вдруге не віднімається.')
+    rows=db.execute("SELECT event,z,premium,ts,reason FROM exit_decisions WHERE trade_id=? AND event IN ('ENTRY','EXIT') ORDER BY ts",(trade_id,)).fetchall()
+    decisions={r['event']:dict(r) for r in rows}
+    def fmt(event,key):
+        value=decisions.get(event,{}).get(key)
+        return f'{float(value):+.2f}' if value is not None else '—'
+    return (f'{title}\n\n📈 Сигнал\n'
+        f'Z-score: {fmt("ENTRY","z")} → {fmt("EXIT","z")}\n'
+        f'Premium: {fmt("ENTRY","premium")}% → {fmt("EXIT","premium")}%\n'
+        f'Вхід: {t["entry"]}\nВихід: {t.get("exit") or "—"}\n'
+        f'Причина: {t.get("reason") or "PAPER_OPEN"}\n'
+        'Графік доступний у локальній вебпанелі → Угоди → 📈. '
+        'Для відкриття через Telegram потрібна доступна HTTPS-адреса.')
+
+async def _bot_api(client,method,payload):
+    token=os.getenv('TELEGRAM_BOT_TOKEN','').strip()
+    response=await client.post(f'https://api.telegram.org/bot{token}/{method}',json=payload,timeout=35)
+    data=response.json()
+    if not data.get('ok'):raise RuntimeError(str(data.get('description','Bot API error'))[:180])
+    return data['result']
+
+async def telegram_poll(db):
+    """Read-only Telegram callbacks. Errors never interrupt market collection."""
+    token=os.getenv('TELEGRAM_BOT_TOKEN','').strip()
+    chat=os.getenv('TELEGRAM_CHAT_ID','').strip()
+    if not token or not chat:return
+    if os.getenv('TELEGRAM_INTERACTIVE_ENABLED','1').lower() in ('0','false','no'):return
+    offset=None
+    async with httpx.AsyncClient(timeout=40) as client:
+        while True:
+            try:
+                updates=await _bot_api(client,'getUpdates',{
+                    'offset':offset,'timeout':25,'allowed_updates':['message','callback_query']})
+                for update in updates:
+                    offset=update['update_id']+1
+                    callback=update.get('callback_query')
+                    if callback:
+                        msg=callback.get('message') or {}
+                        source_chat=str((msg.get('chat') or {}).get('id',''))
+                        data=str(callback.get('data',''))
+                        if source_chat!=chat or not data.startswith('ayla:'):
+                            continue
+                        await _bot_api(client,'answerCallbackQuery',{'callback_query_id':callback['id']})
+                        parts=data.split(':')
+                        if len(parts)==3 and parts[1] in ('cost','signal') and parts[2].isdigit():
+                            details=_trade_detail(db,int(parts[2]),parts[1])
+                            await _bot_api(client,'sendMessage',{'chat_id':chat,'text':details[:3500]})
+                    else:
+                        msg=update.get('message') or {}
+                        if str((msg.get('chat') or {}).get('id',''))!=chat:continue
+                        command=(msg.get('text') or '').split(' ',1)[0].split('@')[0]
+                        if command=='/widget_test':
+                            await _bot_api(client,'sendMessage',{'chat_id':chat,
+                                'text':'🐾 Ayla Funding Bot — перевірка інтерактивних кнопок',
+                                'reply_markup':{'inline_keyboard':[[{'text':'✅ Перевірити кнопку','callback_data':'ayla:signal:0'}]]}})
+            except asyncio.CancelledError:raise
+            except Exception as exc:
+                log.warning('Telegram polling failed; retry in 10s: %s',str(exc)[:160])
+                await asyncio.sleep(10)

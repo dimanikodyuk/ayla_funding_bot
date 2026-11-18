@@ -13,7 +13,7 @@ from .bingx import BingX
 from .trading import PaperEngine
 from .history_intelligence import history_detail
 from .research_lab import research_report
-from .telegram import notify,notify_trade
+from .telegram import notify,notify_trade,telegram_poll
 from .intelligence import classify, aggregate, signal_summary, premium_series, system_health, daily_report
 from .signal_validation import evaluate, threshold_preview
 from .market_data import ticker_snapshot, fresh_quote, spread_pct, MAX_QUOTE_AGE_SECONDS
@@ -241,10 +241,12 @@ async def lifespan(app):
         last_saved[sym]=max(last_saved.get(sym,0),row['ts'])
     event('INFO','Service start; paper broker only; historical gaps require recovery')
     task=asyncio.create_task(collect())
+    telegram_task=asyncio.create_task(telegram_poll(db))
     yield
-    task.cancel()
-    try:await task
-    except asyncio.CancelledError:pass
+    task.cancel();telegram_task.cancel()
+    for running in (task,telegram_task):
+        try:await running
+        except asyncio.CancelledError:pass
     await client.close();db.close()
 
 app=FastAPI(title='Ayla Funding Bot',lifespan=lifespan)
